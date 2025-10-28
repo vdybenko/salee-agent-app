@@ -1,403 +1,464 @@
-import streamlit as st
-import pandas as pd
-from google.cloud import bigquery
 import json
+from datetime import datetime, timezone
+from typing import Iterable, List, Optional
 
-st.set_page_config(layout="wide")
+import pandas as pd
+import streamlit as st
+from google.cloud import bigquery
 
-client = bigquery.Client()
 
-query = """
-SELECT
-  userId,
-  userLinkedinId,
-  participantLinkedinId,
-  chatId,
-  topicId,
-  conversationType,
-  labels,
-  topicSummary,
-  topicKeywords,
-  topicEmbeddingVector,
-  sentMessages,
-  receivedMessages,
-  reply_ratio,
-  conversationDuration,
-  primary_intent,
-  intent_direction,
-  primary_product_or_service,
-  tone,
-  relationship_stage,
-  conversation_temperature,
-  next_action,
-  next_action_date,
-  firstTopicMessageAt,
-  lastTopicMessageAt,
-  firstConversationMessageAt,
-  lastConversationMessageAt,
-  processedAt,
-  raw_excerpt
-FROM `salee-chrome-extention.SaleeAgent.conversations_embedded`
-ORDER BY lastTopicMessageAt DESC
-"""
+st.set_page_config(page_title="Salee Agent Conversations", layout="wide")
 
-df = client.query(query).to_dataframe()
 
-# Normalize topicKeywords to list[str]
-if 'topicKeywords' in df.columns:
-	def _normalize_keywords(v):
-		if v is None:
-			return []
-		if isinstance(v, (list, tuple)):
-			return [str(x) for x in v]
-		# numpy array
-		try:
-			import numpy as _np
-			if isinstance(v, _np.ndarray):
-				return [str(x) for x in v.tolist()]
-		except Exception:
-			pass
-		# try JSON string
-		if isinstance(v, str):
-			try:
-				data = json.loads(v)
-				if isinstance(data, list):
-					return [str(x) for x in data]
-			except Exception:
-				# fallback: comma-separated
-				return [s.strip() for s in v.split(',') if s.strip()]
-		return [str(v)]
-	
-	df['topicKeywords'] = df['topicKeywords'].apply(_normalize_keywords)
+@st.cache_data(ttl=300)
+def load_conversation_data(limit: int = 30) -> pd.DataFrame:
+    """Load the latest conversations enriched with LinkedIn profile data."""
+    client = bigquery.Client()
+    query = """
+        WITH ranked_conversations AS (
+            SELECT
+                chatId,
+                participantLinkedinId,
+                topicSummary,
+                raw_excerpt,
+                sentMessages,
+                receivedMessages,
+                lastTopicMessageAt,
+                conversationDuration,
+                primary_intent,
+                relationship_stage,
+                labels,
+                ROW_NUMBER() OVER (
+                    PARTITION BY chatId
+                    ORDER BY lastTopicMessageAt DESC
+                ) AS row_number
+            FROM `salee-chrome-extention.SaleeAgent.conversations_embedded`
+        )
+        SELECT
+            rc.chatId,
+            rc.participantLinkedinId,
+            rc.topicSummary,
+            rc.raw_excerpt,
+            rc.sentMessages,
+            rc.receivedMessages,
+            rc.lastTopicMessageAt,
+            rc.conversationDuration,
+            rc.primary_intent,
+            rc.relationship_stage,
+            rc.labels,
+            acc.firstName,
+            acc.lastName,
+            acc.title,
+            acc.country,
+            acc.city,
+            acc.url
+        FROM ranked_conversations rc
+        LEFT JOIN `salee-chrome-extention.salee.linked_in_accounts` acc
+        ON rc.participantLinkedinId = acc.id
+        WHERE rc.row_number = 1
+        ORDER BY rc.lastTopicMessageAt DESC
+        LIMIT @limit
+    """
 
-# Initialize session state for selected topic
-if 'selected_topic' not in st.session_state:
-    st.session_state.selected_topic = None
+    job_config = bigquery.QueryJobConfig(
+        query_parameters=[bigquery.ScalarQueryParameter("limit", "INT64", limit)]
+    )
 
-# Custom CSS for LinkedIn-style interface
-st.markdown("""
-<style>
-.main-container {
-    display: flex;
-    height: 100vh;
-    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-}
+    return client.query(query, job_config=job_config).to_dataframe()
 
-.conversation-list {
-    width: 35%;
-    border-right: 1px solid #e0e0e0;
-    overflow-y: auto;
-    background-color: #f8f9fa;
-}
 
-.conversation-item {
-    padding: 16px;
-    border-bottom: 1px solid #e0e0e0;
-    cursor: pointer;
-    transition: background-color 0.2s;
-    display: flex;
-    align-items: center;
-}
+def _ensure_iterable_labels(raw_labels: Optional[object]) -> List[str]:
+    """Normalize the labels column into a list of strings."""
+    if raw_labels is None or (isinstance(raw_labels, float) and pd.isna(raw_labels)):
+        return []
 
-.conversation-item:hover {
-    background-color: #e8f4fd;
-}
+    if isinstance(raw_labels, (list, tuple, set)):
+        return [str(label).strip() for label in raw_labels if str(label).strip()]
 
-.conversation-item.selected {
-    background-color: #0073b1;
-    color: white;
-}
+    if hasattr(raw_labels, "tolist"):
+        return [str(label).strip() for label in raw_labels.tolist() if str(label).strip()]
 
-.avatar {
-    width: 48px;
-    height: 48px;
-    border-radius: 50%;
-    background-color: #0073b1;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    color: white;
-    font-weight: bold;
-    margin-right: 12px;
-    font-size: 18px;
-}
+    if isinstance(raw_labels, str):
+        try:
+            data = json.loads(raw_labels)
+            if isinstance(data, Iterable) and not isinstance(data, (str, bytes)):
+                return [str(label).strip() for label in data if str(label).strip()]
+        except json.JSONDecodeError:
+            pass
+        return [label.strip() for label in raw_labels.split(",") if label.strip()]
 
-.conversation-info {
-    flex: 1;
-}
+    return [str(raw_labels).strip()] if str(raw_labels).strip() else []
 
-.conversation-title {
-    font-weight: 600;
-    margin-bottom: 4px;
-    font-size: 14px;
-}
 
-.conversation-preview {
-    color: #666;
-    font-size: 12px;
-    margin-bottom: 4px;
-}
+def _initials(first_name: Optional[str], last_name: Optional[str]) -> str:
+    initials = "".join(
+        part[0].upper()
+        for part in [first_name or "", last_name or ""]
+        if part
+    )
+    return initials or "?"
 
-.conversation-meta {
-    font-size: 11px;
-    color: #999;
-}
 
-.conversation-detail {
-    width: 65%;
-    padding: 24px;
-    overflow-y: auto;
-    background-color: white;
-}
+def _format_relative_time(value: Optional[object]) -> str:
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return ""
 
-.detail-header {
-    border-bottom: 1px solid #e0e0e0;
-    padding-bottom: 16px;
-    margin-bottom: 24px;
-}
+    timestamp = pd.to_datetime(value, utc=True, errors="coerce")
+    if pd.isna(timestamp):
+        return ""
 
-.detail-title {
-    font-size: 24px;
-    font-weight: 600;
-    margin-bottom: 8px;
-}
+    now = datetime.now(timezone.utc)
+    delta = now - timestamp
 
-.detail-meta {
-    color: #666;
-    font-size: 14px;
-}
+    if delta.days > 365:
+        years = delta.days // 365
+        return f"{years} yr{'s' if years != 1 else ''} ago"
+    if delta.days > 30:
+        months = delta.days // 30
+        return f"{months} mo{'s' if months != 1 else ''} ago"
+    if delta.days > 0:
+        return f"{delta.days} day{'s' if delta.days != 1 else ''} ago"
 
-.detail-section {
-    margin-bottom: 24px;
-}
+    hours = delta.seconds // 3600
+    if hours > 0:
+        return f"{hours} hr{'s' if hours != 1 else ''} ago"
 
-.detail-section h3 {
-    font-size: 16px;
-    font-weight: 600;
-    margin-bottom: 12px;
-    color: #333;
-}
+    minutes = (delta.seconds % 3600) // 60
+    if minutes > 0:
+        return f"{minutes} min{'s' if minutes != 1 else ''} ago"
 
-.detail-content {
-    background-color: #f8f9fa;
-    padding: 16px;
-    border-radius: 8px;
-    font-size: 14px;
-    line-height: 1.5;
-}
+    return "Just now"
 
-.keywords {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 8px;
-}
 
-.keyword-tag {
-    background-color: #e3f2fd;
-    color: #1976d2;
-    padding: 4px 8px;
-    border-radius: 12px;
-    font-size: 12px;
-    font-weight: 500;
-}
+def _shorten_text(text: Optional[str], width: int = 90) -> str:
+    if not text or pd.isna(text):
+        return ""
+    stripped = str(text).strip()
+    if len(stripped) <= width:
+        return stripped
+    return stripped[: width - 1].rstrip() + "…"
 
-.keyword-tag.product-feedback {
-    background-color: #fff3e0;
-    color: #f57c00;
-}
 
-.stats-grid {
-    display: grid;
-    grid-template-columns: repeat(3, 1fr);
-    gap: 16px;
-    margin-top: 16px;
-}
+def _build_sidebar(label_counts: dict) -> str:
+    default_labels = [
+        ("🔥", "Hot"),
+        ("⭐", "New"),
+        ("📈", "Investors"),
+        ("💡", "Usecases"),
+        ("🧑‍💼", "Hiring"),
+        ("🚫", "Junk"),
+    ]
 
-.stat-card {
-    background-color: #f8f9fa;
-    padding: 16px;
-    border-radius: 8px;
-    text-align: center;
-}
+    items = []
+    if label_counts:
+        sorted_labels = sorted(label_counts.items(), key=lambda item: item[1], reverse=True)
+        for icon, (label, count) in zip(["🔥", "⭐", "📈", "💡", "🧑‍💼", "🚫"], sorted_labels):
+            items.append(
+                f"<li><span class=\"icon\">{icon}</span>{label}<span class=\"count\">{count}</span></li>"
+            )
+        if len(items) < len(default_labels):
+            for icon, label in default_labels[len(items):]:
+                items.append(
+                    f"<li class=\"muted\"><span class=\"icon\">{icon}</span>{label}<span class=\"count\">0</span></li>"
+                )
+    else:
+        for icon, label in default_labels:
+            items.append(
+                f"<li class=\"muted\"><span class=\"icon\">{icon}</span>{label}<span class=\"count\">0</span></li>"
+            )
 
-.stat-value {
-    font-size: 24px;
-    font-weight: 600;
-    color: #0073b1;
-}
+    return "".join(items)
 
-.stat-label {
-    font-size: 12px;
-    color: #666;
-    margin-top: 4px;
-}
 
-.linkedin-button {
-    background-color: #0073b1;
-    color: white;
-    padding: 12px 24px;
-    border: none;
-    border-radius: 6px;
-    text-decoration: none;
-    display: inline-block;
-    font-weight: 500;
-    margin-top: 16px;
-}
+def _build_conversation_items(df: pd.DataFrame) -> str:
+    rows = []
+    for _, row in df.iterrows():
+        full_name = " ".join(filter(None, [row.get("firstName"), row.get("lastName")])).strip()
+        display_name = full_name or "Unknown contact"
+        initials = _initials(row.get("firstName"), row.get("lastName"))
+        role_parts = [
+            row.get("title"),
+            ", ".join(filter(None, [row.get("city"), row.get("country")])),
+        ]
+        role_text = " • ".join([part for part in role_parts if part])
+        preview = _shorten_text(row.get("topicSummary") or row.get("raw_excerpt"))
+        relative_time = _format_relative_time(row.get("lastTopicMessageAt"))
+        total_messages = (row.get("sentMessages") or 0) + (row.get("receivedMessages") or 0)
 
-.linkedin-button:hover {
-    background-color: #005885;
-    color: white;
-    text-decoration: none;
-}
-</style>
-""", unsafe_allow_html=True)
+        rows.append(
+            f"""
+            <div class=\"conversation-item\">
+                <div class=\"avatar\">{initials}</div>
+                <div class=\"conversation-body\">
+                    <div class=\"conversation-header\">
+                        <div>
+                            <div class=\"name\">{display_name}</div>
+                            <div class=\"meta\">{role_text}</div>
+                        </div>
+                        <div class=\"time\">{relative_time}</div>
+                    </div>
+                    <div class=\"message\">{preview or 'No recent summary available.'}</div>
+                    <div class=\"stats\">
+                        <span class=\"pill\">{total_messages} messages</span>
+                        {f"<span class='pill neutral'>{row.get('primary_intent')}</span>" if row.get('primary_intent') else ''}
+                        {f"<span class='pill outline'>{row.get('relationship_stage')}</span>" if row.get('relationship_stage') else ''}
+                    </div>
+                </div>
+            </div>
+            """
+        )
+    return "".join(rows)
 
-# Create the main interface
-st.markdown('<div class="main-container">', unsafe_allow_html=True)
 
-# Left panel - Topic list
-st.markdown('<div class="conversation-list">', unsafe_allow_html=True)
-st.markdown('<h2 style="padding: 16px; margin: 0; background-color: #0073b1; color: white;">Topics</h2>', unsafe_allow_html=True)
+def _build_styles() -> str:
+    return """
+        <style>
+            body, .block-container {
+                background-color: #f5f7fb;
+                padding: 0;
+            }
+            .block-container {
+                padding-top: 2rem;
+                padding-left: 2.5rem;
+                padding-right: 2.5rem;
+            }
+            .app-shell {
+                background-color: #ffffff;
+                border-radius: 24px;
+                box-shadow: 0 20px 60px rgba(15, 23, 42, 0.12);
+                display: grid;
+                grid-template-columns: 220px 1fr;
+                gap: 0;
+                overflow: hidden;
+                min-height: 80vh;
+            }
+            .sidebar {
+                background: linear-gradient(180deg, #f8fbff 0%, #eef4ff 100%);
+                padding: 32px 24px;
+                border-right: 1px solid #e5ecf6;
+            }
+            .sidebar h2 {
+                font-size: 18px;
+                margin-bottom: 16px;
+                color: #1f2937;
+            }
+            .sidebar ul {
+                list-style: none;
+                padding: 0;
+                margin: 0;
+                display: flex;
+                flex-direction: column;
+                gap: 12px;
+            }
+            .sidebar li {
+                display: flex;
+                align-items: center;
+                justify-content: space-between;
+                background-color: rgba(255, 255, 255, 0.8);
+                padding: 10px 12px;
+                border-radius: 12px;
+                font-size: 14px;
+                color: #1f2937;
+                font-weight: 500;
+                transition: all 0.2s ease;
+                box-shadow: inset 0 0 0 1px rgba(148, 163, 184, 0.2);
+            }
+            .sidebar li:hover {
+                transform: translateX(4px);
+                box-shadow: inset 0 0 0 1px #2563eb;
+            }
+            .sidebar li.muted {
+                color: #94a3b8;
+                box-shadow: inset 0 0 0 1px rgba(148, 163, 184, 0.15);
+            }
+            .sidebar .icon {
+                margin-right: 10px;
+                font-size: 16px;
+            }
+            .sidebar .count {
+                background-color: #2563eb;
+                color: #ffffff;
+                border-radius: 999px;
+                padding: 2px 8px;
+                font-size: 12px;
+                font-weight: 600;
+            }
+            .sidebar li.muted .count {
+                background-color: #e2e8f0;
+                color: #64748b;
+            }
+            .content {
+                padding: 32px 40px;
+                display: flex;
+                flex-direction: column;
+                gap: 32px;
+            }
+            .header {
+                display: flex;
+                align-items: center;
+                gap: 16px;
+            }
+            .header img {
+                width: 48px;
+                height: 48px;
+                border-radius: 12px;
+            }
+            .header h1 {
+                margin: 0;
+                font-size: 28px;
+                color: #111827;
+            }
+            .header p {
+                margin: 0;
+                color: #6b7280;
+                font-size: 15px;
+            }
+            .conversation-list {
+                display: flex;
+                flex-direction: column;
+                gap: 12px;
+            }
+            .conversation-item {
+                background-color: #f8fbff;
+                border-radius: 18px;
+                padding: 18px 20px;
+                display: flex;
+                gap: 16px;
+                align-items: flex-start;
+                border: 1px solid #e5ecf6;
+                transition: transform 0.2s ease, box-shadow 0.2s ease;
+            }
+            .conversation-item:hover {
+                transform: translateY(-3px);
+                box-shadow: 0 12px 32px rgba(37, 99, 235, 0.12);
+                border-color: #bfdbfe;
+            }
+            .avatar {
+                width: 52px;
+                height: 52px;
+                border-radius: 16px;
+                background: linear-gradient(135deg, #2563eb 0%, #1d4ed8 100%);
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                color: #ffffff;
+                font-weight: 700;
+                font-size: 18px;
+                box-shadow: 0 10px 20px rgba(37, 99, 235, 0.25);
+                flex-shrink: 0;
+            }
+            .conversation-body {
+                flex: 1;
+                display: flex;
+                flex-direction: column;
+                gap: 8px;
+            }
+            .conversation-header {
+                display: flex;
+                justify-content: space-between;
+                align-items: flex-start;
+                gap: 12px;
+            }
+            .name {
+                font-size: 18px;
+                font-weight: 600;
+                color: #0f172a;
+            }
+            .meta {
+                font-size: 13px;
+                color: #64748b;
+                margin-top: 4px;
+            }
+            .time {
+                font-size: 13px;
+                color: #2563eb;
+                font-weight: 600;
+            }
+            .message {
+                font-size: 15px;
+                color: #1f2937;
+                line-height: 1.5;
+            }
+            .stats {
+                display: flex;
+                gap: 8px;
+                flex-wrap: wrap;
+            }
+            .pill {
+                background-color: rgba(37, 99, 235, 0.12);
+                color: #1d4ed8;
+                padding: 4px 10px;
+                border-radius: 999px;
+                font-size: 12px;
+                font-weight: 600;
+            }
+            .pill.neutral {
+                background-color: rgba(16, 185, 129, 0.12);
+                color: #047857;
+            }
+            .pill.outline {
+                background-color: transparent;
+                color: #475569;
+                border: 1px solid #cbd5f5;
+            }
+            @media (max-width: 960px) {
+                .app-shell {
+                    grid-template-columns: 1fr;
+                }
+                .sidebar {
+                    display: none;
+                }
+                .block-container {
+                    padding: 0 1.25rem 2rem;
+                }
+            }
+        </style>
+    """
 
-for idx, row in df.iterrows():
-    chat_id = row['chatId']
-    topic_id = row['topicId']
-    summary = row['topicSummary'][:100] + "..." if len(str(row['topicSummary'])) > 100 else row['topicSummary']
-    date_col = row['lastTopicMessageAt'] if pd.notna(row.get('lastTopicMessageAt', None)) else row['lastConversationMessageAt']
-    date = pd.to_datetime(date_col).strftime('%b %d, %Y') if pd.notna(date_col) else ''
-    
-    # Create avatar with first letter of topic or chat
-    avatar_text = str(topic_id or chat_id)[0].upper() if (topic_id or chat_id) else "?"
-    
-    # Check if this topic is selected
-    is_selected = st.session_state.selected_topic == topic_id
-    item_class = "conversation-item selected" if is_selected else "conversation-item"
-    
-    # Create clickable topic item
-    if st.button(" ", key=f"topic_{topic_id}_{idx}", help=f"Click to view topic {topic_id}"):
-        st.session_state.selected_topic = topic_id
-        st.rerun()
-    
-    st.markdown(f"""
-    <div class="{item_class}">
-        <div class="avatar">{avatar_text}</div>
-        <div class="conversation-info">
-            <div class="conversation-title">Topic {topic_id} · Chat {chat_id}</div>
-            <div class="conversation-preview">{summary}</div>
-            <div class="conversation-meta">{date}</div>
+
+def main() -> None:
+    try:
+        conversations = load_conversation_data()
+    except Exception as exc:  # pragma: no cover - Streamlit error reporting
+        st.error("Unable to load conversation data. Please verify your data source configuration.")
+        st.stop()
+
+    conversations["label_list"] = conversations["labels"].apply(_ensure_iterable_labels)
+
+    label_counts: dict = {}
+    for labels in conversations["label_list"]:
+        for label in labels:
+            label_counts[label] = label_counts.get(label, 0) + 1
+
+    st.markdown(_build_styles(), unsafe_allow_html=True)
+
+    sidebar_html = _build_sidebar(label_counts)
+    conversation_items_html = _build_conversation_items(conversations)
+
+    st.markdown(
+        f"""
+        <div class=\"app-shell\">
+            <aside class=\"sidebar\">
+                <h2>Labels</h2>
+                <ul>{sidebar_html}</ul>
+            </aside>
+            <section class=\"content\">
+                <div class=\"header\">
+                    <img src=\"https://res2.weblium.site/res/63aad091b5bd9f000db82b0b/66d596109d1d3227fab0bfda_optimized_376.webp\" alt=\"Salee Agent logo\" />
+                    <div>
+                        <h1>Salee Agent</h1>
+                        <p>AI-Powered B2B Sales Assistant</p>
+                    </div>
+                </div>
+                <div class=\"conversation-list\">
+                    {conversation_items_html or '<p>No conversations available.</p>'}
+                </div>
+            </section>
         </div>
-    </div>
-    """, unsafe_allow_html=True)
+        """,
+        unsafe_allow_html=True,
+    )
 
-st.markdown('</div>', unsafe_allow_html=True)
 
-# Right panel - Topic details
-st.markdown('<div class="conversation-detail">', unsafe_allow_html=True)
-
-if st.session_state.selected_topic:
-	# Get the selected topic data
-	selected_row = df[df['topicId'] == st.session_state.selected_topic].iloc[0]
-	last_dt = selected_row['lastTopicMessageAt'] if pd.notna(selected_row.get('lastTopicMessageAt', None)) else selected_row['lastConversationMessageAt']
-	st.markdown(f"""
-	<div class="detail-header">
-		<div class="detail-title">Topic {st.session_state.selected_topic} · Chat {selected_row['chatId']}</div>
-		<div class="detail-meta">Last updated: {pd.to_datetime(last_dt).strftime('%B %d, %Y at %I:%M %p') if pd.notna(last_dt) else ''}</div>
-	</div>
-	""", unsafe_allow_html=True)
-	
-	# Conversation summary
-	st.markdown('<div class="detail-section"><h3>Summary</h3><div class="detail-content">' + str(selected_row['topicSummary']) + '</div></div>', unsafe_allow_html=True)
-	
-	# Keywords
-	keywords = selected_row['topicKeywords'] if isinstance(selected_row['topicKeywords'], (list, tuple)) else []
-	if keywords:
-		keyword_html_items = []
-		for kw in keywords:
-			kw_text = str(kw).strip()
-			cls = 'keyword-tag product-feedback' if kw_text == 'product-feedback' else 'keyword-tag'
-			keyword_html_items.append(f'<span class="{cls}">{kw_text}</span>')
-		keyword_html = ''.join(keyword_html_items)
-		st.markdown(f'<div class="detail-section"><h3>Keywords</h3><div class="keywords">{keyword_html}</div></div>', unsafe_allow_html=True)
-	
-	# Statistics
-	st.markdown(f"""
-	<div class="detail-section">
-		<h3>Statistics</h3>
-		<div class="stats-grid">
-			<div class="stat-card">
-				<div class="stat-value">{selected_row['sentMessages']}</div>
-				<div class="stat-label">Messages sent</div>
-			</div>
-			<div class="stat-card">
-				<div class="stat-value">{selected_row['receivedMessages']}</div>
-				<div class="stat-label">Messages received</div>
-			</div>
-			<div class="stat-card">
-				<div class="stat-value">{round(selected_row['conversationDuration'] / 3600, 1) if selected_row['conversationDuration'] > 0 else 0}</div>
-				<div class="stat-label">Duration (hours)</div>
-			</div>
-            <div class="stat-card">
-                <div class="stat-value">{round(selected_row['reply_ratio'], 2) if pd.notna(selected_row.get('reply_ratio', None)) else '-'}</div>
-                <div class="stat-label">Reply ratio</div>
-            </div>
-            <div class="stat-card">
-                <div class="stat-value">{round(selected_row['conversation_temperature'], 2) if pd.notna(selected_row.get('conversation_temperature', None)) else '-'}</div>
-                <div class="stat-label">Temperature</div>
-            </div>
-		</div>
-	</div>
-	""", unsafe_allow_html=True)
-	
-	# Attributes
-	attr_items = []
-	def _add_attr(label, value):
-		if pd.notna(value) and str(value) != '':
-			attr_items.append(f"<div><b>{label}:</b> {value}</div>")
-	_add_attr("Primary intent", selected_row.get('primary_intent', ''))
-	_add_attr("Intent direction", selected_row.get('intent_direction', ''))
-	_add_attr("Primary product/service", selected_row.get('primary_product_or_service', ''))
-	_add_attr("Tone", selected_row.get('tone', ''))
-	_add_attr("Relationship stage", selected_row.get('relationship_stage', ''))
-	_add_attr("Next action", selected_row.get('next_action', ''))
-	_add_attr("Next action date", selected_row.get('next_action_date', ''))
-	_add_attr("First topic message at", selected_row.get('firstTopicMessageAt', ''))
-	_add_attr("Last topic message at", selected_row.get('lastTopicMessageAt', ''))
-	_add_attr("First conversation message at", selected_row.get('firstConversationMessageAt', ''))
-	_add_attr("Last conversation message at", selected_row.get('lastConversationMessageAt', ''))
-	if attr_items:
-		st.markdown('<div class="detail-section"><h3>Attributes</h3><div class="detail-content">' + ''.join(attr_items) + '</div></div>', unsafe_allow_html=True)
-
-	# LinkedIn link (chat scope)
-	linkedin_url = f"https://www.linkedin.com/messaging/thread/{selected_row['chatId']}/"
-	st.markdown(f'<a href="{linkedin_url}" target="_blank" class="linkedin-button">Open in LinkedIn</a>', unsafe_allow_html=True)
-	
-else:
-	st.markdown("""
-	<div style="text-align: center; padding: 60px 20px; color: #666;">
-		<h2>Select a topic to view details</h2>
-		<p>Choose a topic from the list on the left to see its details here.</p>
-	</div>
-	""", unsafe_allow_html=True)
-
-st.markdown('</div>', unsafe_allow_html=True)
-st.markdown('</div>', unsafe_allow_html=True)
-
-# JavaScript for conversation selection (placeholder)
-st.markdown("""
-<script>
-function selectConversation(chatId) {
-    // handled via Streamlit session state buttons
-}
-</script>
-""", unsafe_allow_html=True)
-
-# Summary statistics at the bottom
-st.markdown("---")
-col1, col2, col3 = st.columns(3)
-with col1:
-	st.metric("Total Conversations", len(df))
-with col2:
-	st.metric("Total Messages", int(df['sentMessages'].fillna(0).sum()) + int(df['receivedMessages'].fillna(0).sum()))
-with col3:
-	avg_dur = df['conversationDuration'].fillna(0).mean()
-	st.metric("Avg Duration (hours)", round(avg_dur / 3600, 1) if avg_dur > 0 else 0)
+if __name__ == "__main__":
+    main()
